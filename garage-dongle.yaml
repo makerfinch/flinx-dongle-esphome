@@ -1,0 +1,230 @@
+# ESPHome for the F-linX / Noru "Smart Door - USB 02" Wi-Fi dongle itself
+# (board FORCE DOOR 10405023-V1.0, Wireless-Tag WT32C3-S6 = ESP32-C3, 4 MB).
+# Replaces the cloud firmware with a local Home Assistant cover. No extra
+# hardware: the dongle goes back into the opener's socket as it came.
+#
+# An STC8G1K08 on the board sits between the ESP and the USB-A plug and relays
+# the frames jan-k decoded on the motor socket (github.com/kratochvil-jan/garage-esp32).
+# The ESP reaches the STC on UART1, TX = GPIO6, RX = GPIO7, 115200 8N1, 3.3 V.
+#
+# Proven on one opener: open, close, stop, live position, end-of-travel.
+# NOT proven: partial open, and the light command (see the light block).
+
+esphome:
+  name: garage-dongle
+  friendly_name: Garage Dongle
+  on_boot:
+    priority: -100
+    then:
+      # The stock firmware sends this to the STC once at boot; the STC answers
+      # with a 30-byte frame carrying the dongle id.
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x45, 0xA5, 0xA5] }
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  # Status frames arrive several times a second while the door moves; push them
+  # to HA as they come rather than batching.
+  batch_delay: 0ms
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+uart:
+  id: uart_bus
+  tx_pin: GPIO6
+  rx_pin: GPIO7
+  baud_rate: 115200
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+  # Uncomment to log every raw byte, both directions. uartex drops frames that
+  # fail its header/length check silently, so this is how to see what arrives.
+  # debug:
+  #   direction: BOTH
+  #   dummy_receiver: false
+  #   after:
+  #     delimiter: "\r"
+
+# eigger's uartex. jan-k's pin (v251114) no longer compiles on ESPHome 2026.9
+# (text_sensor raw_state was removed); v260904 does.
+external_components:
+  - source: github://eigger/espcomponents@v260904
+    components: [uartex]
+    refresh: 7d
+
+uartex:
+  id: bus_uartex
+  rx_timeout: 10ms
+  tx_delay: 100ms
+  tx_timeout: 500ms
+  tx_retry_cnt: 3
+  # Status frames only: 0x40 0x11 ... 0x0d, 17 bytes. The STC's 30-byte id reply
+  # (0x40 0x1e) and the command echoes do not match and are dropped.
+  rx_header: [0x40, 0x11]
+  rx_length: 17
+  rx_footer: [0x0D]
+  tx_header: []
+  tx_footer: [0x0D]
+  tx_checksum: !lambda |-
+    uint32_t sum = 0;
+    for (int i = 0; i < len; i++) sum += data[i];
+    return (sum & 0xFF);
+  version:
+    disabled: false
+  error:
+    disabled: false
+  log:
+    disabled: false
+
+# Status frame (payload after the 2-byte header, 14 bytes):
+#   [0] 0x49   [1] 00 opening / 01 stopped / 02 closing   [2] f0 LED on / f1 off
+#   ... [11] position 0-100 %   [13] checksum
+# e.g. 40 11 49 01 f0 02 79 02 7e 6f fe 00 4c 64 02 a5 0d  -> stopped, 100 % open
+globals:
+  - id: door_position_pct
+    type: int
+    initial_value: "-1"
+
+sensor:
+  - platform: uartex
+    id: door_position
+    name: Door position
+    unit_of_measurement: "%"
+    icon: mdi:garage
+    accuracy_decimals: 0
+    state:
+      data: [0x00]
+      mask: [0x00]
+    state_number:
+      offset: 11
+      length: 1
+      precision: 0
+    on_value:
+      then:
+        - lambda: |-
+            id(door_position_pct) = (int) x;
+            id(garage_door).position = x > 0 ? COVER_OPEN : COVER_CLOSED;
+            id(garage_door).publish_state();
+  - platform: uptime
+    name: Uptime
+  - platform: wifi_signal
+    name: Wi-Fi signal
+    update_interval: 60s
+  - platform: internal_temperature
+    name: Chip temperature
+
+text_sensor:
+  - platform: uartex
+    id: door_operation
+    name: Door operation
+    icon: mdi:garage-open
+    lambda: |-
+      if (len == 14) {
+        if (data[1] == 0x00) return "Opening";
+        if (data[1] == 0x01) return "Stopped";
+        if (data[1] == 0x02) return "Closing";
+      }
+      return std::string("Unknown ") + std::to_string(len);
+    on_value:
+      then:
+        - lambda: |-
+            if (x == "Opening")      id(garage_door).current_operation = COVER_OPERATION_OPENING;
+            else if (x == "Closing") id(garage_door).current_operation = COVER_OPERATION_CLOSING;
+            else                     id(garage_door).current_operation = COVER_OPERATION_IDLE;
+            id(garage_door).publish_state();
+  - platform: wifi_info
+    ip_address:
+      name: IP address
+    mac_address:
+      name: MAC address
+
+# The HA entity that matters: a garage cover with real open / close / stop. State
+# comes only from the status frames above, never assumed from the command sent.
+#
+# has_position is OFF on purpose: with it on, HA advertises
+# set-position and its cover dialog then always opens on the % slider, which this
+# opener cannot honour anyway (no go-to-position command). Off, the dialog opens
+# on the up / stop / down buttons. The live percentage is still `Door position`
+# above; the cover itself reports open / closed / opening / closing.
+cover:
+  - platform: template
+    id: garage_door
+    name: Garage Door
+    device_class: garage
+    has_position: false
+    optimistic: false
+    assumed_state: false
+    lambda: |-
+      if (id(door_position_pct) < 0) return {};
+      return id(door_position_pct) > 0 ? COVER_OPEN : COVER_CLOSED;
+    open_action:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x00, 0x00] }
+      - logger.log: "cover: OPEN sent"
+    close_action:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x02, 0x00] }
+      - logger.log: "cover: CLOSE sent"
+    stop_action:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x01, 0x00] }
+      - logger.log: "cover: STOP sent"
+
+# The opener's courtesy light. Status byte [2]: f0 on, f1 off. The command is
+# UNTESTED: jan-k's notes give "on" as 23 07 41 f0 01, his YAML as f0 00.
+light:
+  - platform: uartex
+    name: Opener light
+    icon: mdi:lightbulb
+    state:
+      data: [0x00]
+      mask: [0x00]
+    state_on:
+      offset: 2
+      data: [0xF0]
+    state_off:
+      offset: 2
+      data: [0xF1]
+    command_on:
+      data: [0x23, 0x07, 0x41, 0xF0, 0x00]
+    command_off:
+      data: [0x23, 0x07, 0x41, 0xF1, 0x00]
+
+# GPIO4 drives the dongle's LED.
+switch:
+  - platform: gpio
+    id: gpio4_out
+    name: Dongle LED
+    pin: GPIO4
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+
+button:
+  - platform: restart
+    name: Restart
+  # Partial open (ventilation position). UNTESTED.
+  - platform: template
+    name: Partial open
+    icon: mdi:garage-alert
+    on_press:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x03, 0x00] }
+      - logger.log: "PARTIAL OPEN sent"
+  # Re-send the STC start-up frame by hand (bench aid).
+  - platform: template
+    name: STC handshake
+    icon: mdi:handshake
+    entity_category: diagnostic
+    on_press:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x45, 0xA5, 0xA5] }
